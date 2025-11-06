@@ -132,48 +132,57 @@ class LeetCodePlugin(Star):
     @filter.command("lcr")
     async def lcr(self, event: AstrMessageEvent):
         """随机获取一题（支持分类：hot/all/sql/interview/75）"""
+        import random
+    
         text = (event.message_str or "").strip().lower()
         slug_map = {
             "hot": "leetcode-curated-algo-100",
-            "all": "all-code-essentials",
+            "all": "",
             "sql": "sql-50",
             "interview": "top-interview-questions",
             "75": "leetcode-75",
         }
         category = slug_map.get(text, "leetcode-curated-algo-100")
-
+    
         query = {
             "query": """
-                query problemsetRandomFilteredQuestion($categorySlug: String!, $filters: QuestionListFilterInput) {
-                    problemsetRandomFilteredQuestion(categorySlug: $categorySlug, filters: $filters)
+                query problemsetQuestionList($categorySlug: String, $limit: Int, $skip: Int, $filters: QuestionListFilterInput) {
+                    problemsetQuestionList(categorySlug: $categorySlug, limit: $limit, skip: $skip, filters: $filters) {
+                        questions {
+                            titleSlug
+                            translatedTitle
+                            difficulty
+                        }
+                    }
                 }
             """,
-            "variables": {"categorySlug": category, "filters": {}},
-            "operationName": "problemsetRandomFilteredQuestion",
+            "variables": {"categorySlug": category, "limit": 100, "skip": 0, "filters": {}},
+            "operationName": "problemsetQuestionList",
         }
-
+    
         res = await self._graphql(query)
-
-        # --- 安全检查部分 ---
-        if not res or "data" not in res or not res["data"]:
-            yield event.plain_result("⚠️ 无法获取题目，请稍后再试（接口返回空数据）")
+        if not res or "data" not in res or not res["data"].get("problemsetQuestionList"):
+            yield event.plain_result("⚠️ 无法获取题库列表，请稍后再试。")
             return
-
-        slug = res["data"].get("problemsetRandomFilteredQuestion")
-        if not slug:
-            yield event.plain_result(f"⚠️ 分类 `{text or 'hot'}` 无法返回题目，请检查分类或稍后再试。")
+    
+        questions = res["data"]["problemsetQuestionList"]["questions"]
+        if not questions:
+            yield event.plain_result(f"⚠️ 分类 `{text or 'hot'}` 下没有题目。")
             return
-
-        # --- 获取题目详细内容 ---
+    
+        question = random.choice(questions)
+        slug = question["titleSlug"]
+    
+        # 获取详细内容
         prob_data = await self._get_problem(slug)
         if not prob_data or "data" not in prob_data or not prob_data["data"].get("question"):
             yield event.plain_result("⚠️ 无法获取题目详细信息。")
             return
-
+    
         problem = prob_data["data"]["question"]
         msg = (
             f"## LeetCode 随机题 ({text or 'HOT 100'})\n"
-            f"### {problem['translatedTitle']}\n"
+            f"### {question['translatedTitle']} ({question['difficulty']})\n"
             f"---\n{problem['translatedContent']}\n---\n🔗 https://leetcode.cn/problems/{slug}"
         )
         yield event.plain_result(msg)
