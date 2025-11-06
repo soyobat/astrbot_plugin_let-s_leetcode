@@ -50,13 +50,30 @@ class LeetCodePlugin(Star):
 
     async def _graphql(self, query: dict):
         """发送 GraphQL 请求"""
-        async with aiohttp.ClientSession() as session:
-            async with session.post("https://leetcode.cn/graphql", json=query) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"[LeetCode] GraphQL 请求失败: {resp.status} {text}")
-                    return None
-                return await resp.json()
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://leetcode.cn",
+            "Origin": "https://leetcode.cn",
+        }
+        async with aiohttp.ClientSession(headers=headers) as session:
+            try:
+                async with session.post("https://leetcode.cn/graphql", json=query, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"[LeetCode] GraphQL 请求失败: {resp.status} {text}")
+                        return None
+                    result = await resp.json()
+                    if "errors" in result:
+                        logger.error(f"[LeetCode] GraphQL 返回错误: {result['errors']}")
+                        return None
+                    return result
+            except asyncio.TimeoutError:
+                logger.error("[LeetCode] GraphQL 请求超时")
+                return None
+            except Exception as e:
+                logger.error(f"[LeetCode] GraphQL 请求异常: {e}")
+                return None
 
     async def _get_problem(self, slug: str):
         """获取题目内容"""
@@ -64,6 +81,8 @@ class LeetCodePlugin(Star):
             "query": """
                 query questionTranslations($titleSlug: String!) {
                     question(titleSlug: $titleSlug) {
+                        questionId
+                        questionFrontendId
                         translatedTitle
                         translatedContent
                         difficulty
@@ -99,17 +118,32 @@ class LeetCodePlugin(Star):
         if not res or "data" not in res:
             raise ValueError("LeetCode 返回空数据")
 
-        data = res["data"]["todayRecord"][0]["question"]
+        today_record = res["data"].get("todayRecord")
+        if not today_record or len(today_record) == 0:
+            raise ValueError("今日没有每日一题")
+
+        data = today_record[0]["question"]
         slug = data["titleSlug"]
         problem_data = await self._get_problem(slug)
 
+        if not problem_data or "data" not in problem_data or not problem_data["data"].get("question"):
+            raise ValueError("无法获取题目详细内容")
+
+        question = problem_data["data"]["question"]
+        content = question.get("translatedContent", "")
+        if not content:
+            content = "题目内容获取失败，请访问链接查看"
+
+        # 处理 frontendQuestionId 别名
+        question_id = data.get("frontendQuestionId") or data.get("questionFrontendId", "")
+        
         return {
-            "id": data["frontendQuestionId"],
-            "title": data["translatedTitle"],
-            "difficulty": data["difficulty"],
+            "id": question_id,
+            "title": data.get("translatedTitle", ""),
+            "difficulty": data.get("difficulty", ""),
             "slug": slug,
             "url": f"https://leetcode.cn/problems/{slug}",
-            "content": problem_data["data"]["question"]["translatedContent"],
+            "content": content,
         }
 
     async def _send_daily_problem(self):
@@ -117,9 +151,10 @@ class LeetCodePlugin(Star):
         problem = await self._get_daily_problem()
         for session_id in self.lc_auto_daily_ids:
             try:
+                id_str = f"{problem['id']}. " if problem.get('id') else ""
                 msg = (
                     f"## LeetCode 每日一题\n"
-                    f"### {problem['id']}. {problem['title']} ({problem['difficulty']})\n"
+                    f"### {id_str}{problem['title']} ({problem['difficulty']})\n"
                     f"---\n{problem['content']}\n---\n🔗 {problem['url']}"
                 )
                 await self.context.send_message(session_id, MessageEventResult.plain(msg))
@@ -134,9 +169,10 @@ class LeetCodePlugin(Star):
         """获取每日一题"""
         try:
             problem = await self._get_daily_problem()
+            id_str = f"{problem['id']}. " if problem.get('id') else ""
             msg = (
                 f"## LeetCode 每日一题\n"
-                f"### {problem['id']}. {problem['title']} ({problem['difficulty']})\n"
+                f"### {id_str}{problem['title']} ({problem['difficulty']})\n"
                 f"---\n{problem['content']}\n---\n🔗 {problem['url']}"
             )
             yield event.plain_result(msg)
@@ -170,16 +206,25 @@ class LeetCodePlugin(Star):
                     }
                 }
             """,
-            "variables": {"categorySlug": category, "limit": 100, "skip": 0, "filters": {}},
+            "variables": {
+                "categorySlug": category if category else None,
+                "limit": 100,
+                "skip": 0,
+                "filters": {}
+            },
             "operationName": "problemsetQuestionList",
         }
 
         res = await self._graphql(query)
         if not res or "data" not in res or not res["data"].get("problemsetQuestionList"):
-            yield event.plain_result("⚠️ 无法获取题库列表，请稍后再试。")
+            error_msg = "⚠️ 无法获取题库列表，请稍后再试。"
+            if res and "errors" in res:
+                error_msg += f"\n错误信息: {res['errors']}"
+            yield event.plain_result(error_msg)
             return
 
-        questions = res["data"]["problemsetQuestionList"].get("data", [])
+        problemset = res["data"]["problemsetQuestionList"]
+        questions = problemset.get("questions", []) if "questions" in problemset else problemset.get("data", [])
         if not questions:
             yield event.plain_result(f"⚠️ 分类 `{text or 'hot'}` 下没有题目。")
             return
@@ -190,14 +235,25 @@ class LeetCodePlugin(Star):
         # 获取详细内容
         prob_data = await self._get_problem(slug)
         if not prob_data or "data" not in prob_data or not prob_data["data"].get("question"):
-            yield event.plain_result("⚠️ 无法获取题目详细信息。")
+            # 如果无法获取详细内容，至少返回基本信息
+            msg = (
+                f"## LeetCode 随机题 ({text or 'HOT 100'})\n"
+                f"### {question.get('translatedTitle', '')} ({question.get('difficulty', '')})\n"
+                f"---\n⚠️ 无法获取题目详细内容，请访问链接查看\n---\n"
+                f"🔗 https://leetcode.cn/problems/{slug}"
+            )
+            yield event.plain_result(msg)
             return
 
         problem = prob_data["data"]["question"]
+        content = problem.get("translatedContent", "")
+        if not content:
+            content = "题目内容获取失败，请访问链接查看"
+
         msg = (
             f"## LeetCode 随机题 ({text or 'HOT 100'})\n"
-            f"### {question['translatedTitle']} ({question['difficulty']})\n"
-            f"---\n{problem['translatedContent']}\n---\n🔗 https://leetcode.cn/problems/{slug}"
+            f"### {question.get('translatedTitle', '')} ({question.get('difficulty', '')})\n"
+            f"---\n{content}\n---\n🔗 https://leetcode.cn/problems/{slug}"
         )
         yield event.plain_result(msg)
 
