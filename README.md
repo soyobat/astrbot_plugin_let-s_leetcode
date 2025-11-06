@@ -1,9 +1,10 @@
-# helloworld
+# leetcode
 
-AstrBot 插件模板
-
-A template plugin for AstrBot plugin feature
-
-# 支持
-
-[帮助文档](https://astrbot.app)
+## 功能
+| 指令               | 功能                 |
+| ---------------- | ------------------ |
+| `/lcd`           | 获取当日 LeetCode 每日一题 |
+| `/lcr`           | 从 HOT 100 随机抽题     |
+| `/lcr sql`       | 随机 SQL 热题          |
+| `/lcr interview` | 随机面试题              |
+| `/lcauto`        | 开启/关闭每日早上9点推送每日一题  |
