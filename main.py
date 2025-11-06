@@ -1,24 +1,200 @@
+import aiohttp
+import asyncio
+import json
+import os
+import logging
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
 from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
+
+@register("leetcode", "Soyo", "获取 LeetCode 每日一题与随机题目（支持分类）", "1.0.0")
+class LeetCodePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        self.NAMESPACE = "astrbot_plugin_leetcode"
+        self.scheduler = AsyncIOScheduler()
+        self.data_file = f"data/{self.NAMESPACE}_data.json"
+        self.lc_auto_daily_ids = []
+        self.context = context
+        self.logger = logging.getLogger("astrbot")
 
     async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        """插件初始化"""
+        os.makedirs("data", exist_ok=True)
+        if not os.path.exists(self.data_file):
+            with open(self.data_file, "w", encoding="utf-8") as f:
+                json.dump({}, f, ensure_ascii=False)
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        try:
+            with open(self.data_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.lc_auto_daily_ids = data.get("lc_auto_daily_ids", [])
+        except Exception:
+            self.lc_auto_daily_ids = []
+
+        if self.lc_auto_daily_ids:
+            self._start_cron_if_not()
+            logger.info(f"[LeetCode] 已启动每日推送任务，订阅者数量: {len(self.lc_auto_daily_ids)}")
+
+    def _save_data(self):
+        with open(self.data_file, "w", encoding="utf-8") as f:
+            json.dump({"lc_auto_daily_ids": self.lc_auto_daily_ids}, f, ensure_ascii=False, indent=2)
+
+    def _start_cron_if_not(self):
+        if not self.scheduler.get_jobs():
+            self.scheduler.add_job(self._send_daily_problem, "cron", hour=9, minute=0)
+            self.scheduler.start()
+
+    async def _graphql(self, query: dict):
+        """发送 GraphQL 请求"""
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://leetcode.cn/graphql", json=query) as resp:
+                return await resp.json()
+
+    async def _get_problem(self, slug: str):
+        """获取题目内容"""
+        query = {
+            "query": """
+                query questionTranslations($titleSlug: String!) {
+                    question(titleSlug: $titleSlug) {
+                        translatedTitle
+                        translatedContent
+                    }
+                }
+            """,
+            "variables": {"titleSlug": slug},
+            "operationName": "questionTranslations",
+        }
+        return await self._graphql(query)
+
+    async def _get_daily_problem(self):
+        """获取每日一题"""
+        query = {
+            "query": """
+                query questionOfToday {
+                    todayRecord {
+                        question {
+                            questionId
+                            frontendQuestionId: questionFrontendId
+                            difficulty
+                            translatedTitle
+                            titleSlug
+                        }
+                    }
+                }
+            """,
+            "operationName": "questionOfToday",
+            "variables": {},
+        }
+        data = (await self._graphql(query))["data"]["todayRecord"][0]["question"]
+        slug = data["titleSlug"]
+        problem_data = await self._get_problem(slug)
+        return {
+            "id": data["frontendQuestionId"],
+            "title": data["translatedTitle"],
+            "difficulty": data["difficulty"],
+            "slug": slug,
+            "url": f"https://leetcode.cn/problems/{slug}",
+            "content": problem_data["data"]["question"]["translatedContent"],
+        }
+
+    async def _send_daily_problem(self):
+        """定时推送每日一题"""
+        problem = await self._get_daily_problem()
+        for session_id in self.lc_auto_daily_ids:
+            try:
+                msg = (
+                    f"## LeetCode 每日一题\n"
+                    f"### {problem['id']}. {problem['title']} ({problem['difficulty']})\n"
+                    f"---\n{problem['content']}\n---\n🔗 {problem['url']}"
+                )
+                await self.context.send_message(session_id, MessageEventResult.plain(msg))
+                await asyncio.sleep(1)
+            except Exception as e:
+                logger.error(f"推送失败 ({session_id}): {e}")
+
+    # -------------------- 指令部分 --------------------
+
+    @filter.command("lcd")
+    async def lcd(self, event: AstrMessageEvent):
+        """获取每日一题"""
+        problem = await self._get_daily_problem()
+        msg = (
+            f"## LeetCode 每日一题\n"
+            f"### {problem['id']}. {problem['title']} ({problem['difficulty']})\n"
+            f"---\n{problem['content']}\n---\n🔗 {problem['url']}"
+        )
+        yield event.plain_result(msg)
+
+    @filter.command("lcr")
+    async def lcr(self, event: AstrMessageEvent):
+        """随机获取一题（支持分类：hot/all/sql/interview/75）"""
+        text = (event.message_str or "").strip().lower()
+        slug_map = {
+            "hot": "leetcode-curated-algo-100",
+            "all": "all-code-essentials",
+            "sql": "sql-50",
+            "interview": "top-interview-questions",
+            "75": "leetcode-75",
+        }
+        category = slug_map.get(text, "leetcode-curated-algo-100")
+
+        query = {
+            "query": """
+                query problemsetRandomFilteredQuestion($categorySlug: String!, $filters: QuestionListFilterInput) {
+                    problemsetRandomFilteredQuestion(categorySlug: $categorySlug, filters: $filters)
+                }
+            """,
+            "variables": {"categorySlug": category, "filters": {}},
+            "operationName": "problemsetRandomFilteredQuestion",
+        }
+
+        res = await self._graphql(query)
+
+        # --- 安全检查部分 ---
+        if not res or "data" not in res or not res["data"]:
+            yield event.plain_result("⚠️ 无法获取题目，请稍后再试（接口返回空数据）")
+            return
+
+        slug = res["data"].get("problemsetRandomFilteredQuestion")
+        if not slug:
+            yield event.plain_result(f"⚠️ 分类 `{text or 'hot'}` 无法返回题目，请检查分类或稍后再试。")
+            return
+
+        # --- 获取题目详细内容 ---
+        prob_data = await self._get_problem(slug)
+        if not prob_data or "data" not in prob_data or not prob_data["data"].get("question"):
+            yield event.plain_result("⚠️ 无法获取题目详细信息。")
+            return
+
+        problem = prob_data["data"]["question"]
+        msg = (
+            f"## LeetCode 随机题 ({text or 'HOT 100'})\n"
+            f"### {problem['translatedTitle']}\n"
+            f"---\n{problem['translatedContent']}\n---\n🔗 https://leetcode.cn/problems/{slug}"
+        )
+        yield event.plain_result(msg)
+
+
+    @filter.command("lcauto")
+    async def lcauto(self, event: AstrMessageEvent):
+        """切换每日推送订阅状态"""
+        umo_id = event.unified_msg_origin
+        if umo_id in self.lc_auto_daily_ids:
+            self.lc_auto_daily_ids.remove(umo_id)
+            self._save_data()
+            yield event.plain_result(f"❌ 已取消 {umo_id} 的每日一题推送订阅。")
+        else:
+            self.lc_auto_daily_ids.append(umo_id)
+            self._save_data()
+            self._start_cron_if_not()
+            yield event.plain_result(f"✅ 已为 {umo_id} 开启每日推送（每天 9:00）")
 
     async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        """插件卸载/停用时调用"""
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
+            logger.info("[LeetCode] 调度器已停止")
